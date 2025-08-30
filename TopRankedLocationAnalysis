@@ -1,0 +1,304 @@
+# --- 1. Import Libraries ---
+import os
+import xarray as xr
+import numpy as np
+import pandas as pd
+import math
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import r2_score
+
+# --- 2. Configuration and Setup ---
+print("\n--- Configuration ---")
+# Set a professional plot style
+sns.set_theme(style="whitegrid")
+
+# Define the target coordinates for the case study
+TARGET_LAT = -20.50
+TARGET_LON = 117.00
+print(f"Analyzing top-ranked site at: Latitude={TARGET_LAT}, Longitude={TARGET_LON}")
+
+# --- Project Directory Setup ---
+# This script assumes a standard project structure and should be run from the 'src' directory.
+data_dir = '../data'
+results_dir = '../results'
+case_study_dir = os.path.join(results_dir, 'case_study_plots')
+
+# Create a dedicated directory for the case study plots
+os.makedirs(case_study_dir, exist_ok=True)
+print(f"Case study plots will be saved in: {case_study_dir}")
+
+# --- Physical Model Constants ---
+TOTAL_PANELS = 24
+PANEL_TILT_ANGLE_DEG = 15.0
+SINGLE_PANEL_AREA_M2 = 1.67
+TOTAL_PANEL_AREA_M2 = TOTAL_PANELS * SINGLE_PANEL_AREA_M2
+PANEL_EFFICIENCY_STC = 0.189
+TEMP_COEFFICIENT_POWER = -0.0035
+ABSORPTION_COEFFICIENT_ALPHA = 0.9
+U_VALUE_EQUATIONS = {
+    0:   {'coeffs': [-0.2077, 9.6903, -4.0275]}, 45:  {'coeffs': [-0.3674, 12.72, -2.916]},
+    90:  {'coeffs': [-0.3315, 13.661, -2.8986]}, 135: {'coeffs': [-0.3493, 11.015, -1.9121]},
+    180: {'coeffs': [-0.2829, 10.707, -4.0648]}, 225: {'coeffs': [-0.2462, 9.3337, -3.2717]},
+    270: {'coeffs': [-0.1987, 7.6439, -4.4963]}, 315: {'coeffs': [-0.1857, 8.69, -3.2924]}
+}
+U_VALUE_ANGLES = np.array(list(U_VALUE_EQUATIONS.keys()))
+CHARACTERISTIC_LENGTH = 5.736
+A_AVG = -6.45
+B_AVG = 21.38
+
+# --- 3. Physical Model Functions ---
+# (Functions are unchanged and included here for completeness)
+
+def get_u_value(wind_speed_mps, wind_direction_deg, panel_azimuth_deg):
+    relative_angle = (wind_direction_deg - panel_azimuth_deg + 360) % 360
+    closest_angle_idx = np.argmin(np.abs(U_VALUE_ANGLES - relative_angle))
+    closest_angle = U_VALUE_ANGLES[closest_angle_idx]
+    a, b, c = U_VALUE_EQUATIONS[closest_angle]['coeffs']
+    u_val = a * wind_speed_mps**2 + b * wind_speed_mps + c
+    if a < 0:
+        x_max = -b / (2 * a)
+        if wind_speed_mps >= x_max:
+            u_val = a * x_max**2 + b * x_max + c
+    return max(5.0, u_val)
+
+def calculate_operating_temp_and_efficiency(irradiance_g, ambient_temp_c, u_value):
+    if irradiance_g <= 0:
+        return ambient_temp_c, PANEL_EFFICIENCY_STC * (1 + TEMP_COEFFICIENT_POWER * (ambient_temp_c - 25.0))
+    t_cell = ambient_temp_c + 25
+    for _ in range(10):
+        efficiency = PANEL_EFFICIENCY_STC * (1 + TEMP_COEFFICIENT_POWER * (t_cell - 25.0))
+        t_cell_new = ambient_temp_c + (ABSORPTION_COEFFICIENT_ALPHA * irradiance_g * (1 - efficiency)) / u_value
+        if abs(t_cell_new - t_cell) < 0.1:
+            t_cell = t_cell_new
+            break
+        t_cell = t_cell_new
+    return t_cell, PANEL_EFFICIENCY_STC * (1 + TEMP_COEFFICIENT_POWER * (t_cell - 25.0))
+
+def calculate_tilted_irradiance(ssrd_j_m2, lat_deg, lon_deg, time_coord, tilt_angle_deg, panel_azimuth_deg):
+    ssrd_w_m2 = ssrd_j_m2 / 3600.0
+    if ssrd_w_m2 <= 0: return 0.0
+    time = pd.to_datetime(str(time_coord))
+    latitude_rad, tilt_rad, panel_azimuth_rad = map(np.radians, [lat_deg, tilt_angle_deg, panel_azimuth_deg])
+    day_of_year = time.timetuple().tm_yday
+    utc_hour = time.hour + time.minute / 60.0
+    local_solar_time = utc_hour + (lon_deg / 15.0)
+    declination_rad = np.radians(-23.45 * np.cos(np.radians(360.0 / 365.0 * (day_of_year + 10))))
+    hour_angle_rad = np.radians(15.0 * (local_solar_time - 12.0))
+    solar_altitude_rad = np.arcsin(np.sin(declination_rad) * np.sin(latitude_rad) + np.cos(declination_rad) * np.cos(latitude_rad) * np.cos(hour_angle_rad))
+    if solar_altitude_rad < np.radians(1): return 0.0
+    solar_zenith_rad = np.pi/2 - solar_altitude_rad
+    cos_azimuth_num = (np.sin(solar_altitude_rad) * np.sin(latitude_rad) - np.sin(declination_rad))
+    cos_azimuth_den = (np.cos(solar_altitude_rad) * np.cos(latitude_rad))
+    solar_azimuth_rad = np.arccos(np.clip(cos_azimuth_num / cos_azimuth_den, -1, 1)) if abs(cos_azimuth_den) > 1e-6 else 0
+    if local_solar_time > 12: solar_azimuth_rad = 2 * np.pi - solar_azimuth_rad
+    cos_aoi = (np.cos(solar_zenith_rad) * np.cos(tilt_rad) + np.sin(solar_zenith_rad) * np.sin(tilt_rad) * np.cos(solar_azimuth_rad - panel_azimuth_rad))
+    if cos_aoi <= 0: return 0.0
+    return max(0, ssrd_w_m2 * min(cos_aoi / np.cos(solar_zenith_rad), 5.0))
+
+def calculate_wavelength_depth_dependent(mean_wave_period, depth):
+    g = 9.81
+    if mean_wave_period <=0 or depth <= 0: return 0.0
+    L_deep = (g * mean_wave_period**2) / (2 * np.pi)
+    if depth > L_deep / 2: return L_deep
+    L_n = L_deep
+    for _ in range(10):
+        L_nplus1 = L_deep * np.tanh(2 * np.pi / L_n * depth)
+        if abs(L_nplus1 - L_n) < 0.01: return L_nplus1
+        L_n = L_nplus1
+    return L_n
+
+def calculate_pitch_amplitude(significant_wave_height, mean_wave_period, depth):
+    if mean_wave_period <= 0 or depth <= 0 or significant_wave_height <= 0: return 0.0, 0.0
+    wavelength = calculate_wavelength_depth_dependent(mean_wave_period, depth)
+    if wavelength <= 0: return 0.0, 0.0
+    non_dim_wave_height = significant_wave_height / CHARACTERISTIC_LENGTH
+    non_dim_wavelength = wavelength / CHARACTERISTIC_LENGTH
+    c_predicted = 38 * non_dim_wave_height - 15.81
+    pitch_amplitude = (A_AVG * non_dim_wavelength**2) + (B_AVG * non_dim_wavelength) + c_predicted
+    return max(0, pitch_amplitude), wavelength
+
+def get_variable_from_ds(ds, potential_names):
+    for name in potential_names:
+        if name in ds.variables: return ds[name]
+    raise KeyError(f"Missing variable from list: {potential_names}")
+
+# --- 4. Load and Process Data ---
+print("\n--- Loading and Processing Data ---")
+era5_files_and_vars = {
+    'u_wind': {'path': os.path.join(data_dir, 'U_wind1.nc'), 'vars': ['u10']},
+    'v_wind': {'path': os.path.join(data_dir, 'V_wind1.nc'), 'vars': ['v10']},
+    'mwp':    {'path': os.path.join(data_dir, 'MeanWavePeriod.nc'), 'vars': ['mwp']},
+    'swh':    {'path': os.path.join(data_dir, 'SignificantWave.nc'), 'vars': ['swh']},
+    'ssrd':   {'path': os.path.join(data_dir, 'SurfaceSolarRadiation.nc'), 'vars': ['ssrd']},
+    't2m':    {'path': os.path.join(data_dir, '2m_temperature.nc'), 'vars': ['t2m']},
+    'depth':  {'path': os.path.join(data_dir, 'Depth.nc'), 'vars': ['wmb', 'depth', 'd2m']}
+}
+
+try:
+    era5_datasets = {key: xr.open_dataset(item['path']) for key, item in era5_files_and_vars.items()}
+    print("All datasets loaded.")
+    time_coord_name = next(var for var in ['time', 'valid_time'] if var in era5_datasets['u_wind'].coords)
+    time_ts = era5_datasets['u_wind'][time_coord_name].values
+    depth_val = abs(get_variable_from_ds(era5_datasets['depth'], era5_files_and_vars['depth']['vars']).sel(latitude=TARGET_LAT, longitude=TARGET_LON, method='nearest').item())
+    
+    # Extract time series data for the target location
+    u_wind_ts = get_variable_from_ds(era5_datasets['u_wind'], era5_files_and_vars['u_wind']['vars']).sel(latitude=TARGET_LAT, longitude=TARGET_LON, method='nearest').values
+    v_wind_ts = get_variable_from_ds(era5_datasets['v_wind'], era5_files_and_vars['v_wind']['vars']).sel(latitude=TARGET_LAT, longitude=TARGET_LON, method='nearest').values
+    mwp_ts = get_variable_from_ds(era5_datasets['mwp'], era5_files_and_vars['mwp']['vars']).sel(latitude=TARGET_LAT, longitude=TARGET_LON, method='nearest').values
+    swh_ts = get_variable_from_ds(era5_datasets['swh'], era5_files_and_vars['swh']['vars']).sel(latitude=TARGET_LAT, longitude=TARGET_LON, method='nearest').values
+    temp_k_ts = get_variable_from_ds(era5_datasets['t2m'], era5_files_and_vars['t2m']['vars']).sel(latitude=TARGET_LAT, longitude=TARGET_LON, method='nearest').values
+    ssrd_ts = get_variable_from_ds(era5_datasets['ssrd'], era5_files_and_vars['ssrd']['vars']).sel(latitude=TARGET_LAT, longitude=TARGET_LON, method='nearest').values
+
+except FileNotFoundError as e:
+    print(f"ERROR: A required data file was not found. Please ensure all data is in the '{data_dir}' directory. Missing file: {e.filename}")
+    raise
+
+hourly_data = []
+for i in range(len(time_ts)):
+    ambient_temp_c = temp_k_ts[i] - 273.15
+    wind_speed_mps = np.sqrt(u_wind_ts[i]**2 + v_wind_ts[i]**2)
+    wind_dir_deg = (270 - np.degrees(np.arctan2(v_wind_ts[i], u_wind_ts[i]))) % 360
+    irrad_e = calculate_tilted_irradiance(ssrd_ts[i], TARGET_LAT, TARGET_LON, time_ts[i], PANEL_TILT_ANGLE_DEG, 90.0)
+    irrad_w = calculate_tilted_irradiance(ssrd_ts[i], TARGET_LAT, TARGET_LON, time_ts[i], PANEL_TILT_ANGLE_DEG, 270.0)
+    u_val_e, u_val_w = get_u_value(wind_speed_mps, wind_dir_deg, 90.0), get_u_value(wind_speed_mps, wind_dir_deg, 270.0)
+    _, eff_e = calculate_operating_temp_and_efficiency(irrad_e, ambient_temp_c, u_val_e)
+    _, eff_w = calculate_operating_temp_and_efficiency(irrad_w, ambient_temp_c, u_val_w)
+    power_e, power_w = irrad_e * (TOTAL_PANEL_AREA_M2 / 2) * eff_e, irrad_w * (TOTAL_PANEL_AREA_M2 / 2) * eff_w
+    pitch, wavelength = calculate_pitch_amplitude(swh_ts[i], mwp_ts[i], depth_val)
+    loss_factor = np.clip(np.sin(np.radians(pitch)), 0, 1)
+    net_power_kw = (power_e + power_w) / 1000.0 * (1 - loss_factor)
+    avg_eff = (eff_e * irrad_e + eff_w * irrad_w) / (irrad_e + irrad_w) if (irrad_e + irrad_w) > 0 else 0
+    
+    hourly_data.append({
+        'time': time_ts[i], 'net_power_kw': net_power_kw, 'swh_m': swh_ts[i],
+        'wavelength_m': wavelength, 'wave_loss_factor': loss_factor, 'wind_speed_ms': wind_speed_mps,
+        'ambient_temp_c': ambient_temp_c, 'efficiency_percent': avg_eff * 100 if avg_eff > 0 else np.nan
+    })
+
+df = pd.DataFrame(hourly_data)
+df['time'] = pd.to_datetime(df['time'])
+df.set_index('time', inplace=True)
+print("Data processing complete.")
+
+# --- 5. Generate and Save Plots ---
+print("\n--- Generating Plots ---")
+df_daytime = df.dropna(subset=['efficiency_percent'])
+df_waves_with_loss = df[df['wave_loss_factor'] > 0.001].copy()
+avg_wind_speed = df_daytime['wind_speed_ms'].mean()
+avg_temp = df_daytime['ambient_temp_c'].mean()
+avg_efficiency = df_daytime['efficiency_percent'].mean()
+avg_swh = df['swh_m'].mean()
+avg_overall_wave_loss = df['wave_loss_factor'].mean() * 100
+
+# PLOT 1: Daily Power Profile
+fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+time_offset = pd.to_timedelta(TARGET_LON / 15.0, unit='h')
+summer_day = df[df.index.month == 1].first('1D') if not df[df.index.month == 1].empty else pd.DataFrame()
+winter_day = df[df.index.month == 7].first('1D') if not df[df.index.month == 7].empty else pd.DataFrame()
+global_max_power = max(summer_day['net_power_kw'].max() if not summer_day.empty else 0, winter_day['net_power_kw'].max() if not winter_day.empty else 0)
+y_limit = global_max_power * 1.1
+
+for ax, day_data, color, title_part in [(axes[0], summer_day, ('orange', 'darkred'), 'Summer'), (axes[1], winter_day, ('skyblue', 'darkblue'), 'Winter')]:
+    if not day_data.empty:
+        full_day_idx = pd.date_range(start=day_data.index.normalize()[0], periods=24, freq='H')
+        day_data = day_data.reindex(full_day_idx, fill_value=0)
+        local_time_hour = (day_data.index + time_offset).hour
+        ax.bar(local_time_hour, day_data['net_power_kw'], color=color[0], alpha=0.6, label='Hourly Power (kW)')
+        daylight_hours = day_data[day_data['net_power_kw'] > 0]
+        if len(daylight_hours) > 3:
+            x_daylight = (daylight_hours.index + time_offset).hour
+            y_daylight = daylight_hours['net_power_kw']
+            x_anchored = np.concatenate(([x_daylight.min() - 1], x_daylight, [x_daylight.max() + 1]))
+            y_anchored = np.concatenate(([0], y_daylight, [0]))
+            coeffs = np.polyfit(x_anchored, y_anchored, 5)
+            poly = np.poly1d(coeffs)
+            x_smooth = np.linspace(x_anchored.min(), x_anchored.max(), 300)
+            ax.plot(x_smooth, np.maximum(0, poly(x_smooth)), color=color[1], linewidth=2.5, label='Fitted Trend')
+        ax.set_title(f'Power Profile for a Typical {title_part} Day ({day_data.index[0].strftime("%b %d, %Y")})')
+        ax.legend()
+    else:
+        ax.set_title(f'{title_part} data not available')
+    ax.set_ylim(0, y_limit)
+    ax.set_ylabel('Net Power Output (kW)')
+    ax.grid(True)
+    ax.set_xticks(range(0, 24, 2))
+axes[1].set_xlabel('Hour of Day (Local Time)')
+plt.tight_layout()
+plt.savefig(os.path.join(case_study_dir, 'daily_power_profile.png'))
+print("Saved plot 1: Daily Power Profile")
+plt.close()
+
+# PLOT 2: SWH Histogram
+plt.figure(figsize=(10, 6))
+sns.histplot(df['swh_m'], bins=50, kde=False, color='teal')
+plt.axvline(1.5, color='red', linestyle='--', linewidth=2, label='1.5m Operational Limit')
+plt.title(f'Distribution of Significant Wave Heights at Site ({TARGET_LAT}, {TARGET_LON})')
+plt.xlabel('Significant Wave Height (m)')
+plt.ylabel('Frequency (Hours)')
+plt.legend(labels=['1.5m Operational Limit', f'Average SWH: {avg_swh:.2f} m'])
+plt.tight_layout()
+plt.savefig(os.path.join(case_study_dir, 'swh_histogram.png'))
+print("Saved plot 2: SWH Histogram")
+plt.close()
+
+# PLOT 3: Wind vs. Efficiency (Log Fit)
+plt.figure(figsize=(10, 6))
+df_wind_pos = df_daytime[df_daytime['wind_speed_ms'] > 0].copy()
+X_wind, y_wind = np.log(df_wind_pos[['wind_speed_ms']]), df_wind_pos['efficiency_percent']
+model = LinearRegression().fit(X_wind, y_wind)
+r2 = r2_score(y_wind, model.predict(X_wind))
+a, b = model.coef_[0], model.intercept_
+x_plot = np.linspace(X_wind.min().iloc[0], X_wind.max().iloc[0], 200)
+plt.scatter(np.exp(X_wind), y_wind, alpha=0.1, color='green', edgecolors='none')
+plt.plot(np.exp(x_plot), a * x_plot + b, color='red', linewidth=2, label=f'Log Fit: y={a:.2f}ln(x)+{b:.2f} ($R^2={r2:.2f}$)')
+plt.title(f'Wind Speed vs. Panel Efficiency at Site ({TARGET_LAT}, {TARGET_LON})')
+plt.xlabel('Wind Speed (m/s)')
+plt.ylabel('Average Panel Efficiency (%)')
+plt.legend(title=f'Avg Wind: {avg_wind_speed:.2f} m/s | Avg Eff: {avg_efficiency:.2f}%')
+plt.grid(True)
+plt.tight_layout()
+plt.savefig(os.path.join(case_study_dir, 'efficiency_vs_wind.png'))
+print("Saved plot 3: Wind vs. Efficiency")
+plt.close()
+
+# PLOT 4: Temp vs. Efficiency (Linear Fit)
+plt.figure(figsize=(10, 6))
+X_temp, y_temp = df_daytime[['ambient_temp_c']], df_daytime['efficiency_percent']
+model = LinearRegression().fit(X_temp, y_temp)
+r2 = r2_score(y_temp, model.predict(X_temp))
+plt.scatter(X_temp, y_temp, alpha=0.1, color='purple', edgecolors='none')
+plt.plot(X_temp, model.predict(X_temp), color='red', linewidth=2, label=f'Linear Fit: y={model.coef_[0]:.2f}x+{model.intercept_:.2f} ($R^2={r2:.2f}$)')
+plt.title(f'Ambient Temperature vs. Panel Efficiency at Site ({TARGET_LAT}, {TARGET_LON})')
+plt.xlabel('Ambient Temperature (°C)')
+plt.ylabel('Average Panel Efficiency (%)')
+plt.legend(title=f'Avg Temp: {avg_temp:.2f}°C | Avg Eff: {avg_efficiency:.2f}%')
+plt.grid(True)
+plt.tight_layout()
+plt.savefig(os.path.join(case_study_dir, 'efficiency_vs_temp.png'))
+print("Saved plot 4: Temp vs. Efficiency")
+plt.close()
+
+# PLOT 5: Wave Loss Conditions
+fig = plt.figure(figsize=(10, 8))
+main_ax = fig.add_axes([0.1, 0.25, 0.8, 0.65])
+cbar_ax = fig.add_axes([0.1, 0.1, 0.8, 0.04])
+scatter = main_ax.scatter(df_waves_with_loss['wavelength_m'], df_waves_with_loss['swh_m'], c=df_waves_with_loss['wave_loss_factor']*100, cmap='viridis', alpha=0.5)
+main_ax.set_xlabel('Ocean Wavelength (m)')
+main_ax.set_ylabel('Significant Wave Height (m)')
+main_ax.grid(True)
+main_ax.set_title(f'Wave Conditions Causing Power Loss at Site ({TARGET_LAT}, {TARGET_LON})')
+ax_twiny, ax_twinx = main_ax.twiny(), main_ax.twinx()
+ax_twiny.set_xlabel('Non-Dimensional Wavelength')
+ax_twinx.set_ylabel('Non-Dimensional Wave Height')
+xlim, ylim = main_ax.get_xlim(), main_ax.get_ylim()
+ax_twiny.set_xlim(xlim[0] / CHARACTERISTIC_LENGTH, xlim[1] / CHARACTERISTIC_LENGTH)
+ax_twinx.set_ylim(ylim[0] / CHARACTERISTIC_LENGTH, ylim[1] / CHARACTERISTIC_LENGTH)
+fig.colorbar(scatter, cax=cbar_ax, orientation='horizontal', label='Wave-Induced Power Loss (%)')
+main_ax.text(0.05, 0.95, f'Overall Avg Loss: {avg_overall_wave_loss:.2f}%', transform=main_ax.transAxes, verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.7))
+plt.savefig(os.path.join(case_study_dir, 'wave_loss_conditions.png'))
+print("Saved plot 5: Wave Loss Conditions")
+plt.close()
+
+print("\nAll plots generated successfully.")
