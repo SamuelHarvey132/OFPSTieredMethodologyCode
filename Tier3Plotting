@@ -1,0 +1,185 @@
+# --- 0. Import Libraries ---
+import pandas as pd
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+import matplotlib.lines as mlines
+import os
+
+print("Libraries imported successfully.")
+
+# --- 1. Define File Paths & Configuration ---
+# This script assumes a standard project structure and should be run from the 'src' directory.
+data_dir = '../data'
+results_dir = '../results'
+
+# Ensure the results directory exists (though it should from previous scripts)
+os.makedirs(results_dir, exist_ok=True)
+
+# Input file from the previous power estimation script
+data_path = os.path.join(results_dir, 'Power_Estimation_Results.csv')
+# Geospatial data for map background
+coastline_path = os.path.join(data_dir, 'ne_10m_coastline/ne_10m_coastline.shp')
+
+# Output paths for the generated maps
+output_path1 = os.path.join(results_dir, 'Energy_Yield_Map.png')
+output_path2 = os.path.join(results_dir, 'Efficiency_Map.png')
+output_path3 = os.path.join(results_dir, 'Wave_Loss_Map.png')
+
+
+# Color scheme and labels for plots
+PLOT_COLORS_QUINTILE = {
+    'Bottom 20%': '#d73027', '20-40%': '#fc8d59', '40-60%': '#fee090',
+    '60-80%': '#4575b4', 'Top 20%': '#313695'
+}
+QUINTILE_LABELS = ['Bottom 20%', '20-40%', '40-60%', '60-80%', 'Top 20%']
+QUARTILE_LABELS = ['Lowest 25%', '25-50%', '50-75%', 'Highest 25%']
+LOSS_COLORS = {
+    'Lowest 25%': '#ffffcc', '25-50%': '#fd8d3c',
+    '50-75%': '#e31a1c', 'Highest 25%': '#800026', 'Zero': 'gray'
+}
+
+# --- 2. Load Data ---
+try:
+    print(f"Loading data from: {data_path}")
+    df = pd.read_csv(data_path)
+    gdf = gpd.GeoDataFrame(
+        df, geometry=gpd.points_from_xy(df.longitude, df.latitude), crs="EPSG:4326"
+    )
+    print(f"Loaded {len(gdf)} data points.")
+    print("Loading geographical data for map background...")
+    coastline_gdf = gpd.read_file(coastline_path)
+    print("Geographical data loaded.")
+except FileNotFoundError:
+    print(f"ERROR: Input data file not found at {data_path}. Please run the power estimation script first.")
+    raise
+except Exception as e:
+    print(f"Error loading data: {e}")
+    raise
+
+# --- 3. Helper Functions for Plotting ---
+
+def setup_map(ax):
+    """Sets up the background map features for Australia."""
+    ax.set_extent([112, 155, -45, -9], crs=ccrs.PlateCarree())
+    ax.add_feature(cfeature.LAND, edgecolor='black', facecolor='#d9d9d9', zorder=0)
+    ax.add_feature(cfeature.OCEAN, facecolor='#a6cee3', zorder=0)
+    coastline_gdf.plot(ax=ax, edgecolor='black', linewidth=0.8, zorder=2)
+    gl = ax.gridlines(draw_labels=True, linestyle='--', color='gray', alpha=0.6)
+    gl.top_labels = False
+    gl.right_labels = False
+    return ax
+
+def create_quantile_labels(series, base_labels, unit, precision=0):
+    """Creates descriptive labels for quantile bins for the map legend."""
+    full_labels = []
+    q = len(base_labels)
+    try:
+        bins = pd.qcut(series, q=q, duplicates='drop').cat.categories
+        if len(bins) < q:
+            base_labels = base_labels[:len(bins)]
+
+        for i, interval in enumerate(bins):
+            lower_val = max(0, interval.left) # Clamp lower bound to 0 for display
+            lower = f"{lower_val:,.{precision}f}"
+            upper = f"{interval.right:,.{precision}f}"
+            full_labels.append(f"{base_labels[i]} [{lower} - {upper} {unit}]")
+    except Exception:
+        # Fallback for datasets with too few unique values for quantiles
+        unique_vals = sorted(series.unique())
+        return [f"Value: {v}" for v in unique_vals], [f"Bin {i+1}" for i in range(len(unique_vals))]
+    return full_labels, base_labels
+
+# --- 4. Plot 1: Average Yearly Energy Yield (Quintiles) ---
+print("\nGenerating Map 1: Average Yearly Energy Yield...")
+col_energy = 'Average Yearly Net Energy (kWh)'
+energy_full_labels, energy_base_labels = create_quantile_labels(gdf[col_energy], QUINTILE_LABELS, unit='kWh')
+gdf['energy_category'] = pd.qcut(gdf[col_energy], q=len(energy_base_labels), labels=energy_full_labels, duplicates='drop')
+
+fig1, ax1 = plt.subplots(figsize=(20, 16), subplot_kw={'projection': ccrs.PlateCarree()})
+ax1 = setup_map(ax1)
+
+legend_handles = []
+for i, category in enumerate(energy_full_labels):
+    subset = gdf[gdf['energy_category'] == category]
+    if not subset.empty:
+        color_key = energy_base_labels[i]
+        subset.plot(ax=ax1, marker='.', color=PLOT_COLORS_QUINTILE[color_key], markersize=60, alpha=0.9, zorder=3)
+        legend_handles.append(mlines.Line2D([], [], color=PLOT_COLORS_QUINTILE[color_key], marker='.', linestyle='None',
+                                             markersize=15, label=f'{category} ({len(subset)})'))
+
+ax1.set_title('Average Yearly Net Energy Yield (Quintiles)', fontsize=20, fontweight='bold')
+ax1.legend(handles=legend_handles, title='Energy Yield Categories', loc='lower left',
+           fontsize=20, title_fontsize=20, frameon=True, facecolor='white', framealpha=0.8)
+
+plt.tight_layout()
+plt.savefig(output_path1, dpi=300, bbox_inches='tight')
+print(f"Map 1 saved to {output_path1}")
+plt.show()
+
+# --- 5. Plot 2: Average Operating Efficiency (Quintiles) ---
+print("\nGenerating Map 2: Average Operating Efficiency...")
+col_eff = 'Average Operating Efficiency (%)'
+eff_full_labels, eff_base_labels = create_quantile_labels(gdf[col_eff], QUINTILE_LABELS, unit='%', precision=2)
+gdf['eff_category'] = pd.qcut(gdf[col_eff], q=len(eff_base_labels), labels=eff_full_labels, duplicates='drop')
+
+fig2, ax2 = plt.subplots(figsize=(20, 16), subplot_kw={'projection': ccrs.PlateCarree()})
+ax2 = setup_map(ax2)
+
+legend_handles = []
+for i, category in enumerate(eff_full_labels):
+    subset = gdf[gdf['eff_category'] == category]
+    if not subset.empty:
+        color_key = eff_base_labels[i]
+        subset.plot(ax=ax2, marker='.', color=PLOT_COLORS_QUINTILE[color_key], markersize=60, alpha=0.9, zorder=3)
+        legend_handles.append(mlines.Line2D([], [], color=PLOT_COLORS_QUINTILE[color_key], marker='.', linestyle='None',
+                                             markersize=15, label=f'{category} ({len(subset)})'))
+
+ax2.set_title('Average Operating Efficiency (Quintiles)', fontsize=20, fontweight='bold')
+ax2.legend(handles=legend_handles, title='Efficiency Categories', loc='lower left',
+           fontsize=20, title_fontsize=20, frameon=True, facecolor='white', framealpha=0.8)
+
+plt.tight_layout()
+plt.savefig(output_path2, dpi=300, bbox_inches='tight')
+print(f"Map 2 saved to {output_path2}")
+plt.show()
+
+# --- 6. Plot 3: Wave-Induced Power Loss (Zero + Quartiles) ---
+print("\nGenerating Map 3: Wave-Induced Power Loss...")
+col_loss = 'Avg Wave Induced Loss (%)'
+
+zero_loss_gdf = gdf[gdf[col_loss] == 0].copy()
+non_zero_loss_gdf = gdf[gdf[col_loss] > 0].copy()
+zero_loss_gdf['loss_category'] = f'Zero Loss ({len(zero_loss_gdf)})'
+
+if not non_zero_loss_gdf.empty:
+    loss_full_labels, loss_base_labels = create_quantile_labels(non_zero_loss_gdf[col_loss], QUARTILE_LABELS, unit='%', precision=4)
+    non_zero_loss_gdf['loss_category'] = pd.qcut(non_zero_loss_gdf[col_loss], q=len(loss_base_labels), labels=loss_full_labels, duplicates='drop')
+
+fig3, ax3 = plt.subplots(figsize=(20, 16), subplot_kw={'projection': ccrs.PlateCarree()})
+ax3 = setup_map(ax3)
+
+legend_handles = []
+if not zero_loss_gdf.empty:
+    zero_loss_gdf.plot(ax=ax3, marker='.', color=LOSS_COLORS['Zero'], markersize=60, alpha=0.9, zorder=3)
+    legend_handles.append(mlines.Line2D([], [], color=LOSS_COLORS['Zero'], marker='.', linestyle='None',
+                                         markersize=15, label=zero_loss_gdf['loss_category'].iloc[0]))
+
+if not non_zero_loss_gdf.empty:
+    for i, category in enumerate(loss_full_labels):
+        subset = non_zero_loss_gdf[non_zero_loss_gdf['loss_category'] == category]
+        if not subset.empty:
+            color_key = loss_base_labels[i]
+            subset.plot(ax=ax3, marker='.', color=LOSS_COLORS[color_key], markersize=60, alpha=0.9, zorder=3)
+            legend_handles.append(mlines.Line2D([], [], color=LOSS_COLORS[color_key], marker='.', linestyle='None',
+                                                 markersize=15, label=f'{category} ({len(subset)})'))
+
+ax3.set_title('Average Wave-Induced Power Loss (Zero + Quartiles)', fontsize=20, fontweight='bold')
+ax3.legend(handles=legend_handles, title='Wave Loss Categories', loc='lower left',
+           fontsize=20, title_fontsize=20, frameon=True, facecolor='white', framealpha=0.8)
+
+plt.tight_layout()
+plt.savefig(output_path3, dpi=300, bbox_inches='tight')
+print(f"Map 3 saved to {output_path3}")
+plt.show()
