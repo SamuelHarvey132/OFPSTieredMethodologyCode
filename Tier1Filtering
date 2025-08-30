@@ -1,0 +1,327 @@
+# --- Mount Google Drive ---
+from google.colab import drive
+import os
+import geopandas as gpd
+import xarray as xr
+import numpy as np
+import matplotlib.pyplot as plt
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+import pandas as pd
+from shapely.geometry import Point
+
+try:
+    drive.mount('/content/drive')
+    base_dir = '/content/drive/MyDrive/DissMaterial/'
+    if not os.path.exists(base_dir):
+        print(f"Warning: The directory '{base_dir}' does not exist. Please check your Drive structure.")
+except Exception as e:
+    print(f"Error mounting Google Drive: {e}")
+    print("Cannot proceed without accessing files. Please check the drive mount setup.")
+    raise
+
+# --- Set up file paths and filtering parameters ---
+coastline_path = os.path.join(base_dir, 'ne_10m_coastline/ne_10m_coastline.shp')
+ocean_path = os.path.join(base_dir, 'ne_10m_ocean/ne_10m_ocean.shp')
+bathymetry_path = os.path.join(base_dir, 'Depth.nc')
+maximum_individual_wave_path = os.path.join(base_dir, 'MaximumIndividualWave.nc')
+instantaneous_wind_path = os.path.join(base_dir, 'InstantaneousWind.nc')
+era5_data_path = os.path.join(base_dir, 'Australia.nc')
+
+# --- Filtering Parameters ---
+max_distance_km = 100
+max_water_depth_m = 60
+max_hmax_m = 5  # CHANGED: Renamed from max_mshw_m to max_hmax_m for clarity
+max_wind_speed_ms = 30
+
+# --- 1. Load Geographical and Metocean Data ---
+try:
+    coastline_gdf = gpd.read_file(coastline_path)
+    global_coastline = coastline_gdf.geometry.union_all()
+    print("Coastline data loaded and geometries dissolved.")
+except Exception as e:
+    print(f"Error loading coastline: {e}. Cannot proceed without coastline data.")
+    raise
+
+try:
+    ocean_gdf = gpd.read_file(ocean_path)
+    global_ocean = ocean_gdf.geometry.union_all()
+    print("Ocean data loaded and geometries dissolved.")
+except Exception as e:
+    print(f"Error loading ocean data: {e}. Cannot perform offshore filtering.")
+    raise
+
+# Load Bathymetry Data
+try:
+    bathymetry_ds = xr.open_dataset(bathymetry_path)
+    depth_variable_name = 'wmb'
+    bathymetry_data = bathymetry_ds[depth_variable_name].squeeze()
+    if 'valid_time' in bathymetry_data.dims:
+        bathymetry_data = bathymetry_data.isel(valid_time=0)
+    if 'lon' in bathymetry_data.dims:
+        bathymetry_data = bathymetry_data.rename({'lon': 'longitude'})
+    if 'lat' in bathymetry_data.dims:
+        bathymetry_data = bathymetry_data.rename({'lat': 'latitude'})
+    print(f"Bathymetry data loaded from '{bathymetry_path}'.")
+except Exception as e:
+    print(f"Error loading bathymetry data: {e}. Stopping execution.")
+    raise
+
+# Load Maximum Individual Wave Height Data
+try:
+    hmax_ds = xr.open_dataset(maximum_individual_wave_path)  # CHANGED: Renamed variable to hmax_ds
+    if 'mshw' in hmax_ds.variables:
+        hmax_variable_name = 'mshw'
+    elif 'hmax' in hmax_ds.variables:
+        hmax_variable_name = 'hmax'
+    else:
+        hmax_variable_name = list(hmax_ds.data_vars)[0]
+        print(f"Warning: 'mshw' or 'hmax' variable not found. Using first variable: '{hmax_variable_name}'.")
+
+    maximum_individual_wave_data = hmax_ds[hmax_variable_name]
+    if 'lon' in maximum_individual_wave_data.dims:
+        maximum_individual_wave_data = maximum_individual_wave_data.rename({'lon': 'longitude'})
+    if 'lat' in maximum_individual_wave_data.dims:
+        maximum_individual_wave_data = maximum_individual_wave_data.rename({'lat': 'latitude'})
+
+    time_dim = None
+    if 'time' in maximum_individual_wave_data.dims:
+        time_dim = 'time'
+    elif 'valid_time' in maximum_individual_wave_data.dims:
+        time_dim = 'valid_time'
+
+    if time_dim:
+        max_hmax_data = maximum_individual_wave_data.max(dim=time_dim, skipna=True) # CHANGED: Renamed to max_hmax_data
+        print(f"Note: Max individual wave height data has a '{time_dim}' dimension. Calculated maximum over time.")
+    else:
+        max_hmax_data = maximum_individual_wave_data.squeeze() # CHANGED: Renamed to max_hmax_data
+        print("Note: Max individual wave height data has no time dimension. Using as-is.")
+
+    max_hmax_data = max_hmax_data.squeeze()
+    if len(max_hmax_data.dims) != 2:
+        raise ValueError(f"Max individual wave data is not 2D after processing. Dimensions: {max_hmax_data.dims}")
+    print(f"Maximum individual wave height data loaded and processed from '{maximum_individual_wave_path}'.")
+except Exception as e:
+    print(f"Error loading wave height data: {e}. Stopping execution.")
+    raise
+
+# Load Instantaneous Wind Data
+try:
+    wind_ds = xr.open_dataset(instantaneous_wind_path)
+    if 'iwind' in wind_ds.variables:
+        wind_variable_name = 'iwind'
+    else:
+        wind_variable_name = list(wind_ds.data_vars)[0]
+        print(f"Warning: Common wind variable name not found. Using first variable: '{wind_variable_name}'.")
+
+    instantaneous_wind_data = wind_ds[wind_variable_name]
+    if 'lon' in instantaneous_wind_data.dims:
+        instantaneous_wind_data = instantaneous_wind_data.rename({'lon': 'longitude'})
+    if 'lat' in instantaneous_wind_data.dims:
+        instantaneous_wind_data = instantaneous_wind_data.rename({'lat': 'latitude'})
+
+    time_dim = None
+    if 'time' in instantaneous_wind_data.dims:
+        time_dim = 'time'
+    elif 'valid_time' in instantaneous_wind_data.dims:
+        time_dim = 'valid_time'
+
+    if time_dim:
+        max_wind_speed_data = instantaneous_wind_data.max(dim=time_dim, skipna=True)
+        print(f"Note: Instantaneous wind data has a '{time_dim}' dimension. Calculated maximum over time.")
+    else:
+        max_wind_speed_data = instantaneous_wind_data.squeeze()
+        print("Note: Instantaneous wind data has no time dimension. Using as-is.")
+
+    max_wind_speed_data = max_wind_speed_data.squeeze()
+    if len(max_wind_speed_data.dims) != 2:
+        raise ValueError(f"Max wind speed data is not 2D after processing. Dimensions: {max_wind_speed_data.dims}")
+    print(f"Maximum instantaneous wind speed data loaded and processed from '{instantaneous_wind_path}'.")
+except Exception as e:
+    print(f"Error loading wind data: {e}. Stopping execution.")
+    raise
+
+# --- 2. Prepare ERA5 Grid Points and Initial DataFrame ---
+try:
+    era5_ds = xr.open_dataset(era5_data_path)
+    lons = era5_ds['longitude'].values
+    lats = era5_ds['latitude'].values
+    print("ERA5 dataset loaded for grid extraction from:", era5_data_path)
+except Exception as e:
+    print(f"Error opening ERA5 dataset: {e}. Stopping execution.")
+    raise
+
+lon_grid, lat_grid = np.meshgrid(lons, lats)
+points = [Point(lon, lat) for lon, lat in zip(lon_grid.flatten(), lat_grid.flatten())]
+all_era5_points_gdf = gpd.GeoDataFrame(geometry=points, crs="EPSG:4326")
+print(f"Created GeoDataFrame with {len(all_era5_points_gdf)} ERA5 grid points.")
+
+# --- 3. Perform All Filtering Steps and Add Conditions ---
+all_era5_points_gdf['cond_dist_100km'] = False
+all_era5_points_gdf['cond_depth_60m'] = False
+all_era5_points_gdf['cond_hmax_5m'] = False # CHANGED: Renamed from cond_mshw_5m
+all_era5_points_gdf['cond_wind_30ms'] = False
+all_era5_points_gdf['cond_ocean'] = False
+
+projected_all_era5_points = all_era5_points_gdf.to_crs("EPSG:32663")
+projected_coastline = gpd.GeoDataFrame(geometry=[global_coastline], crs="EPSG:4326").to_crs("EPSG:32663")
+projected_ocean = gpd.GeoDataFrame(geometry=[global_ocean], crs="EPSG:4326").to_crs("EPSG:32663")
+
+print(f"\nCalculating distance to shore (max {max_distance_km} km)...")
+projected_all_era5_points['distance_to_shore_km'] = projected_all_era5_points.distance(projected_coastline.iloc[0].geometry) / 1000
+all_era5_points_gdf['cond_dist_100km'] = (projected_all_era5_points['distance_to_shore_km'] <= max_distance_km).values
+print(f"Points within {max_distance_km} km of shore: {all_era5_points_gdf['cond_dist_100km'].sum()}")
+
+print("Checking for ocean intersection...")
+temp_ocean_check_gdf = gpd.sjoin(
+    projected_all_era5_points.loc[all_era5_points_gdf['cond_dist_100km']],
+    projected_ocean,
+    how="inner",
+    predicate="intersects"
+)
+all_era5_points_gdf.loc[temp_ocean_check_gdf.index, 'cond_ocean'] = True
+print(f"Points over ocean: {all_era5_points_gdf['cond_ocean'].sum()}")
+
+offshore_relevant_points_gdf = all_era5_points_gdf[
+    all_era5_points_gdf['cond_dist_100km'] & all_era5_points_gdf['cond_ocean']
+].to_crs("EPSG:4326").copy()
+
+if not offshore_relevant_points_gdf.empty:
+    interp_lons = xr.DataArray(offshore_relevant_points_gdf.geometry.x.values, dims='points', coords={'points': offshore_relevant_points_gdf.index})
+    interp_lats = xr.DataArray(offshore_relevant_points_gdf.geometry.y.values, dims='points', coords={'points': offshore_relevant_points_gdf.index})
+
+    print(f"Extracting and filtering by water depth (max {max_water_depth_m} m)...")
+    depth_values = bathymetry_data.interp(longitude=interp_lons, latitude=interp_lats, method='nearest', kwargs={"fill_value": np.nan})
+    offshore_relevant_points_gdf['water_depth_m'] = depth_values.values
+    all_era5_points_gdf.loc[offshore_relevant_points_gdf.index, 'cond_depth_60m'] = (offshore_relevant_points_gdf['water_depth_m'] <= max_water_depth_m).fillna(False).values
+    print(f"Points with depth <= {max_water_depth_m} m: {all_era5_points_gdf['cond_depth_60m'].sum()}")
+
+    print(f"Extracting and filtering by max individual wave height (max {max_hmax_m} m)...") # CHANGED: Refers to max_hmax_m
+    hmax_values = max_hmax_data.interp(longitude=interp_lons, latitude=interp_lats, method='nearest', kwargs={"fill_value": np.nan})
+    offshore_relevant_points_gdf['max_individual_wave_height_m'] = hmax_values.values # CHANGED: Renamed column
+    all_era5_points_gdf.loc[offshore_relevant_points_gdf.index, 'cond_hmax_5m'] = (offshore_relevant_points_gdf['max_individual_wave_height_m'] <= max_hmax_m).fillna(False).values # CHANGED: Renamed column
+    print(f"Points with max individual wave height <= {max_hmax_m} m: {all_era5_points_gdf['cond_hmax_5m'].sum()}")
+
+    print(f"Extracting and filtering by max wind speed (max {max_wind_speed_ms} m/s)...")
+    wind_values = max_wind_speed_data.interp(longitude=interp_lons, latitude=interp_lats, method='nearest', kwargs={"fill_value": np.nan})
+    offshore_relevant_points_gdf['max_wind_speed_ms'] = wind_values.values
+    all_era5_points_gdf.loc[offshore_relevant_points_gdf.index, 'cond_wind_30ms'] = (offshore_relevant_points_gdf['max_wind_speed_ms'] <= max_wind_speed_ms).fillna(False).values
+    print(f"Points with max wind speed <= {max_wind_speed_ms} m/s: {all_era5_points_gdf['cond_wind_30ms'].sum()}")
+else:
+    print("No offshore relevant points found to apply depth, wave and wind filters.")
+
+# --- 4. Assign Categories for Plotting ---
+all_era5_points_gdf['category_name'] = 'Out of Area/Not Offshore'
+ocean_mask = all_era5_points_gdf['cond_ocean']
+
+all_criteria_met_mask = (
+    ocean_mask &
+    all_era5_points_gdf['cond_dist_100km'] &
+    all_era5_points_gdf['cond_depth_60m'] &
+    all_era5_points_gdf['cond_hmax_5m'] & # CHANGED: Used new column name
+    all_era5_points_gdf['cond_wind_30ms']
+)
+all_era5_points_gdf.loc[all_criteria_met_mask, 'category_name'] = f'<100 km, <60m depth, <{max_hmax_m}m Hmax, <{max_wind_speed_ms}m/s Wind' # CHANGED: Used new variable and label
+
+dist_depth_hmax_mask = ( # CHANGED: Renamed variable
+    ocean_mask & all_era5_points_gdf['cond_dist_100km'] & all_era5_points_gdf['cond_depth_60m'] & all_era5_points_gdf['cond_hmax_5m'] & ~all_criteria_met_mask # CHANGED: Used new column name
+)
+all_era5_points_gdf.loc[dist_depth_hmax_mask, 'category_name'] = f'<100 km, <60m depth, <{max_hmax_m}m Hmax' # CHANGED: Used new variable and label
+
+dist_depth_mask = (
+    ocean_mask & all_era5_points_gdf['cond_dist_100km'] & all_era5_points_gdf['cond_depth_60m'] & ~dist_depth_hmax_mask & ~all_criteria_met_mask # CHANGED: Used new variable name
+)
+all_era5_points_gdf.loc[dist_depth_mask, 'category_name'] = f'<100 km from shore & <{max_water_depth_m}m depth'
+
+dist_only_mask = (
+    ocean_mask & all_era5_points_gdf['cond_dist_100km'] & ~dist_depth_mask & ~dist_depth_hmax_mask & ~all_criteria_met_mask # CHANGED: Used new variable name
+)
+all_era5_points_gdf.loc[dist_only_mask, 'category_name'] = f'<100 km from shore'
+
+print("\nCategory distribution:")
+print(all_era5_points_gdf['category_name'].value_counts())
+
+# --- 5. Visualize the Resulting Filtered Sites ---
+plt.figure(figsize=(14, 12))
+ax = plt.axes(projection=ccrs.PlateCarree())
+north_lat_plot, west_lon_plot, south_lat_plot, east_lon_plot = -9.0, 112.0, -45.0, 155.0
+buffer_degrees_plot = 2
+extent_plot = [west_lon_plot - buffer_degrees_plot, east_lon_plot + buffer_degrees_plot, south_lat_plot - buffer_degrees_plot, north_lat_plot + buffer_degrees_plot]
+ax.set_extent(extent_plot, crs=ccrs.PlateCarree())
+ax.add_feature(cfeature.LAND, edgecolor='black', facecolor='lightgray', zorder=0)
+ax.add_feature(cfeature.OCEAN, facecolor='lightblue', zorder=0)
+ax.add_feature(cfeature.BORDERS, linestyle=':', edgecolor='gray', zorder=1)
+coastline_gdf.to_crs("EPSG:4326").plot(ax=ax, edgecolor='black', linewidth=0.8, zorder=1, label='Coastlines')
+
+plot_colors = {
+    'Out of Area/Not Offshore': 'lightgray',
+    f'<100 km from shore': 'orange',
+    f'<100 km from shore & <{max_water_depth_m}m depth': 'blue',
+    f'<100 km, <60m depth, <{max_hmax_m}m Hmax': 'purple',
+    f'<100 km, <60m depth, <{max_hmax_m}m Hmax, <{max_wind_speed_ms}m/s Wind': 'green'
+}
+
+plot_order = [
+    'Out of Area/Not Offshore',
+    f'<100 km from shore',
+    f'<100 km from shore & <{max_water_depth_m}m depth',
+    f'<100 km, <60m depth, <{max_hmax_m}m Hmax',
+    f'<100 km, <60m depth, <{max_hmax_m}m Hmax, <{max_wind_speed_ms}m/s Wind'
+]
+
+for category_name in plot_order:
+    subset = all_era5_points_gdf[all_era5_points_gdf['category_name'] == category_name]
+    if not subset.empty:
+        subset.plot(
+            ax=ax,
+            marker='o',
+            color=plot_colors.get(category_name, 'black'),
+            markersize=5,
+            alpha=0.6,
+            label=f'{category_name} ({len(subset)} points)',
+            zorder=2
+        )
+
+gl = ax.gridlines(draw_labels=True, linestyle='--', color='gray', alpha=0.6)
+gl.top_labels = False
+gl.right_labels = False
+plt.title(f'Offshore Viability Categories for ERA5 Grid Points (Australia)', fontsize=16)
+
+# --- ONLY CHANGE IS HERE ---
+# The old legend line is replaced with this one to move it and make it bigger.
+plt.legend(loc='lower left', fontsize=12, frameon=True, framealpha=0.8)
+
+# The 'bbox_inches' argument is added here to prevent the legend from being cut off
+plt.savefig(os.path.join(base_dir, 'filtered_viability_map.png'), bbox_inches='tight')
+print(f"Plot saved to {os.path.join(base_dir, 'filtered_viability_map.png')}")
+
+
+# --- 6. Extract and Save Optimal Coordinates ---
+# This section is unchanged.
+output_csv_filename = 'OptimalCoords.csv'
+output_csv_path = os.path.join(base_dir, output_csv_filename)
+
+# Create a final GeoDataFrame containing only the points that meet ALL criteria
+optimal_points_gdf = all_era5_points_gdf[
+    all_era5_points_gdf['category_name'] == f'<100 km, <60m depth, <{max_hmax_m}m Hmax, <{max_wind_speed_ms}m/s Wind'
+].copy()
+
+if not optimal_points_gdf.empty:
+    # Get the data from offshore_relevant_points_gdf which contains the metocean values
+    output_df = offshore_relevant_points_gdf.loc[optimal_points_gdf.index, :].copy()
+
+    # Create the final DataFrame with the required columns
+    final_output_df = pd.DataFrame({
+        'longitude': output_df.geometry.x.values,
+        'latitude': output_df.geometry.y.values,
+        'water_depth_m': output_df['water_depth_m'],
+        'max_individual_wave_height_m': output_df['max_individual_wave_height_m'],
+        'max_wind_speed_ms': output_df['max_wind_speed_ms']
+    })
+
+    final_output_df.to_csv(output_csv_path, index=False)
+    print(f"\n{len(final_output_df)} optimal coordinates saved to: {output_csv_path}")
+    print("\nFirst 5 optimal coordinates:")
+    print(final_output_df.head())
+else:
+    print("\nNo points found that satisfy all four conditions to save.")
