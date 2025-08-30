@@ -1,0 +1,70 @@
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Define the wind speed range for extrapolation (from 1 to 30 m/s)
+wind_speed = np.linspace(1, 30, 500)
+
+# Store the coefficients [a, b, c] for the equations y = ax^2 + bx + c
+# and the color for each line.
+equations = {
+    '0°':   {'coeffs': [-0.2077, 9.6903,  -4.0275], 'color': 'darkblue'},
+    '45°':  {'coeffs': [-0.3674, 12.72,   -2.916], 'color': 'darkorange'},
+    '90°':  {'coeffs': [-0.3315, 13.661,  -2.8986], 'color': 'darkgreen'},
+    '135°': {'coeffs': [-0.3493, 11.015,  -1.9121], 'color': 'blue'},
+    '180°': {'coeffs': [-0.2829, 10.707,  -4.0648], 'color': 'purple'},
+    '225°': {'coeffs': [-0.2462,  9.3337,  -3.2717], 'color': 'limegreen'},
+    '270°': {'coeffs': [-0.1987, 7.6439, -4.4963], 'color': 'black'},
+    '315°': {'coeffs': [-0.1857, 8.69,    -3.2924], 'color': 'saddlebrown'}
+}
+
+# --- Plotting ---
+fig, ax = plt.subplots(figsize=(12, 8))
+
+# Calculate and plot the U-value for each wind direction
+for direction, data in equations.items():
+    a, b, c = data['coeffs']
+
+    # Check if it's a downward-opening parabola (a < 0) to find its maximum
+    if a < 0:
+        # Calculate wind speed at which the maximum U-value occurs
+        x_max = -b / (2 * a)
+
+        # Calculate the maximum U-value (the plateau value)
+        y_max = a * x_max**2 + b * x_max + c
+
+        # Use the quadratic equation up to the max, then plateau
+        u_value = np.where(wind_speed < x_max,
+                           a * wind_speed**2 + b * wind_speed + c,
+                           y_max)
+    else:
+        # For any other case, calculate as normal
+        u_value = a * wind_speed**2 + b * wind_speed + c
+
+    # Plot the final curve
+    ax.plot(wind_speed, u_value, label=direction, color=data['color'], linewidth=2.5)
+
+# --- Customize the plot with larger, BOLD text ---
+ax.set_title('Extrapolated U-value with Plateau at Maximum', fontsize=20, fontweight='bold')
+ax.set_xlabel('Wind Speed (m/s)', fontsize=16, fontweight='bold')
+ax.set_ylabel('U-value (W/m²K)', fontsize=16, fontweight='bold')
+
+# Increase the font size and bold the tick labels on both axes
+ax.tick_params(axis='both', which='major', labelsize=14)
+for label in ax.get_xticklabels() + ax.get_yticklabels():
+    label.set_fontweight('bold')
+
+# Increase the font size and bold the legend title and text
+legend = ax.legend(title='Wind Direction', loc='upper left', title_fontsize='15', fontsize='13')
+plt.setp(legend.get_texts(), fontweight='bold')
+plt.setp(legend.get_title(), fontweight='bold')
+
+
+ax.set_xlim(0, 30)
+ax.set_ylim(bottom=0)
+ax.grid(True, which='both', linestyle='--', linewidth=0.7)
+
+# Save the plot as a file
+plt.savefig('extrapolated_u_value_plateau_bold_text.png', dpi=300)
+
+# Display the final plot
+plt.show()
