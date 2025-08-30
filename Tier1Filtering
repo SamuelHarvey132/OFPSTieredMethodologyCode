@@ -1,5 +1,4 @@
-# --- Mount Google Drive ---
-from google.colab import drive
+# --- Import Libraries ---
 import os
 import geopandas as gpd
 import xarray as xr
@@ -10,28 +9,37 @@ import cartopy.feature as cfeature
 import pandas as pd
 from shapely.geometry import Point
 
-try:
-    drive.mount('/content/drive')
-    base_dir = '/content/drive/MyDrive/DissMaterial/'
-    if not os.path.exists(base_dir):
-        print(f"Warning: The directory '{base_dir}' does not exist. Please check your Drive structure.")
-except Exception as e:
-    print(f"Error mounting Google Drive: {e}")
-    print("Cannot proceed without accessing files. Please check the drive mount setup.")
-    raise
+# --- Set up Relative File Paths and Create Output Directory ---
+# This script assumes a project structure like:
+# /your_project_folder/
+#  ├── data/
+#  │   ├── ne_10m_coastline/
+#  │   ├── ERA5_data.nc
+#  │   └── ...
+#  ├── results/
+#  └── src/
+#      └── tier_1_filtering.py  (this script)
 
-# --- Set up file paths and filtering parameters ---
-coastline_path = os.path.join(base_dir, 'ne_10m_coastline/ne_10m_coastline.shp')
-ocean_path = os.path.join(base_dir, 'ne_10m_ocean/ne_10m_ocean.shp')
-bathymetry_path = os.path.join(base_dir, 'Depth.nc')
-maximum_individual_wave_path = os.path.join(base_dir, 'MaximumIndividualWave.nc')
-instantaneous_wind_path = os.path.join(base_dir, 'InstantaneousWind.nc')
-era5_data_path = os.path.join(base_dir, 'Australia.nc')
+# Define paths relative to the project root directory
+data_dir = '../data'
+results_dir = '../results'
+
+# Create the results directory if it doesn't exist
+if not os.path.exists(results_dir):
+    os.makedirs(results_dir)
+
+coastline_path = os.path.join(data_dir, 'ne_10m_coastline/ne_10m_coastline.shp')
+ocean_path = os.path.join(data_dir, 'ne_10m_ocean/ne_10m_ocean.shp')
+bathymetry_path = os.path.join(data_dir, 'Depth.nc')
+maximum_individual_wave_path = os.path.join(data_dir, 'MaximumIndividualWave.nc')
+instantaneous_wind_path = os.path.join(data_dir, 'InstantaneousWind.nc')
+era5_data_path = os.path.join(data_dir, 'Australia.nc')
+
 
 # --- Filtering Parameters ---
 max_distance_km = 100
 max_water_depth_m = 60
-max_hmax_m = 5  # CHANGED: Renamed from max_mshw_m to max_hmax_m for clarity
+max_hmax_m = 5
 max_wind_speed_ms = 30
 
 # --- 1. Load Geographical and Metocean Data ---
@@ -69,7 +77,7 @@ except Exception as e:
 
 # Load Maximum Individual Wave Height Data
 try:
-    hmax_ds = xr.open_dataset(maximum_individual_wave_path)  # CHANGED: Renamed variable to hmax_ds
+    hmax_ds = xr.open_dataset(maximum_individual_wave_path)
     if 'mshw' in hmax_ds.variables:
         hmax_variable_name = 'mshw'
     elif 'hmax' in hmax_ds.variables:
@@ -91,10 +99,10 @@ try:
         time_dim = 'valid_time'
 
     if time_dim:
-        max_hmax_data = maximum_individual_wave_data.max(dim=time_dim, skipna=True) # CHANGED: Renamed to max_hmax_data
+        max_hmax_data = maximum_individual_wave_data.max(dim=time_dim, skipna=True)
         print(f"Note: Max individual wave height data has a '{time_dim}' dimension. Calculated maximum over time.")
     else:
-        max_hmax_data = maximum_individual_wave_data.squeeze() # CHANGED: Renamed to max_hmax_data
+        max_hmax_data = maximum_individual_wave_data.squeeze()
         print("Note: Max individual wave height data has no time dimension. Using as-is.")
 
     max_hmax_data = max_hmax_data.squeeze()
@@ -159,7 +167,7 @@ print(f"Created GeoDataFrame with {len(all_era5_points_gdf)} ERA5 grid points.")
 # --- 3. Perform All Filtering Steps and Add Conditions ---
 all_era5_points_gdf['cond_dist_100km'] = False
 all_era5_points_gdf['cond_depth_60m'] = False
-all_era5_points_gdf['cond_hmax_5m'] = False # CHANGED: Renamed from cond_mshw_5m
+all_era5_points_gdf['cond_hmax_5m'] = False
 all_era5_points_gdf['cond_wind_30ms'] = False
 all_era5_points_gdf['cond_ocean'] = False
 
@@ -196,10 +204,10 @@ if not offshore_relevant_points_gdf.empty:
     all_era5_points_gdf.loc[offshore_relevant_points_gdf.index, 'cond_depth_60m'] = (offshore_relevant_points_gdf['water_depth_m'] <= max_water_depth_m).fillna(False).values
     print(f"Points with depth <= {max_water_depth_m} m: {all_era5_points_gdf['cond_depth_60m'].sum()}")
 
-    print(f"Extracting and filtering by max individual wave height (max {max_hmax_m} m)...") # CHANGED: Refers to max_hmax_m
+    print(f"Extracting and filtering by max individual wave height (max {max_hmax_m} m)...")
     hmax_values = max_hmax_data.interp(longitude=interp_lons, latitude=interp_lats, method='nearest', kwargs={"fill_value": np.nan})
-    offshore_relevant_points_gdf['max_individual_wave_height_m'] = hmax_values.values # CHANGED: Renamed column
-    all_era5_points_gdf.loc[offshore_relevant_points_gdf.index, 'cond_hmax_5m'] = (offshore_relevant_points_gdf['max_individual_wave_height_m'] <= max_hmax_m).fillna(False).values # CHANGED: Renamed column
+    offshore_relevant_points_gdf['max_individual_wave_height_m'] = hmax_values.values
+    all_era5_points_gdf.loc[offshore_relevant_points_gdf.index, 'cond_hmax_5m'] = (offshore_relevant_points_gdf['max_individual_wave_height_m'] <= max_hmax_m).fillna(False).values
     print(f"Points with max individual wave height <= {max_hmax_m} m: {all_era5_points_gdf['cond_hmax_5m'].sum()}")
 
     print(f"Extracting and filtering by max wind speed (max {max_wind_speed_ms} m/s)...")
@@ -218,23 +226,23 @@ all_criteria_met_mask = (
     ocean_mask &
     all_era5_points_gdf['cond_dist_100km'] &
     all_era5_points_gdf['cond_depth_60m'] &
-    all_era5_points_gdf['cond_hmax_5m'] & # CHANGED: Used new column name
+    all_era5_points_gdf['cond_hmax_5m'] &
     all_era5_points_gdf['cond_wind_30ms']
 )
-all_era5_points_gdf.loc[all_criteria_met_mask, 'category_name'] = f'<100 km, <60m depth, <{max_hmax_m}m Hmax, <{max_wind_speed_ms}m/s Wind' # CHANGED: Used new variable and label
+all_era5_points_gdf.loc[all_criteria_met_mask, 'category_name'] = f'<100 km, <60m depth, <{max_hmax_m}m Hmax, <{max_wind_speed_ms}m/s Wind'
 
-dist_depth_hmax_mask = ( # CHANGED: Renamed variable
-    ocean_mask & all_era5_points_gdf['cond_dist_100km'] & all_era5_points_gdf['cond_depth_60m'] & all_era5_points_gdf['cond_hmax_5m'] & ~all_criteria_met_mask # CHANGED: Used new column name
+dist_depth_hmax_mask = (
+    ocean_mask & all_era5_points_gdf['cond_dist_100km'] & all_era5_points_gdf['cond_depth_60m'] & all_era5_points_gdf['cond_hmax_5m'] & ~all_criteria_met_mask
 )
-all_era5_points_gdf.loc[dist_depth_hmax_mask, 'category_name'] = f'<100 km, <60m depth, <{max_hmax_m}m Hmax' # CHANGED: Used new variable and label
+all_era5_points_gdf.loc[dist_depth_hmax_mask, 'category_name'] = f'<100 km, <60m depth, <{max_hmax_m}m Hmax'
 
 dist_depth_mask = (
-    ocean_mask & all_era5_points_gdf['cond_dist_100km'] & all_era5_points_gdf['cond_depth_60m'] & ~dist_depth_hmax_mask & ~all_criteria_met_mask # CHANGED: Used new variable name
+    ocean_mask & all_era5_points_gdf['cond_dist_100km'] & all_era5_points_gdf['cond_depth_60m'] & ~dist_depth_hmax_mask & ~all_criteria_met_mask
 )
 all_era5_points_gdf.loc[dist_depth_mask, 'category_name'] = f'<100 km from shore & <{max_water_depth_m}m depth'
 
 dist_only_mask = (
-    ocean_mask & all_era5_points_gdf['cond_dist_100km'] & ~dist_depth_mask & ~dist_depth_hmax_mask & ~all_criteria_met_mask # CHANGED: Used new variable name
+    ocean_mask & all_era5_points_gdf['cond_dist_100km'] & ~dist_depth_mask & ~dist_depth_hmax_mask & ~all_criteria_met_mask
 )
 all_era5_points_gdf.loc[dist_only_mask, 'category_name'] = f'<100 km from shore'
 
@@ -287,19 +295,17 @@ gl.top_labels = False
 gl.right_labels = False
 plt.title(f'Offshore Viability Categories for ERA5 Grid Points (Australia)', fontsize=16)
 
-# --- ONLY CHANGE IS HERE ---
-# The old legend line is replaced with this one to move it and make it bigger.
 plt.legend(loc='lower left', fontsize=12, frameon=True, framealpha=0.8)
 
-# The 'bbox_inches' argument is added here to prevent the legend from being cut off
-plt.savefig(os.path.join(base_dir, 'filtered_viability_map.png'), bbox_inches='tight')
-print(f"Plot saved to {os.path.join(base_dir, 'filtered_viability_map.png')}")
+# Save the plot to the 'results' directory
+plot_path = os.path.join(results_dir, 'filtered_viability_map.png')
+plt.savefig(plot_path, bbox_inches='tight')
+print(f"Plot saved to {plot_path}")
 
 
 # --- 6. Extract and Save Optimal Coordinates ---
-# This section is unchanged.
 output_csv_filename = 'OptimalCoords.csv'
-output_csv_path = os.path.join(base_dir, output_csv_filename)
+output_csv_path = os.path.join(results_dir, output_csv_filename)
 
 # Create a final GeoDataFrame containing only the points that meet ALL criteria
 optimal_points_gdf = all_era5_points_gdf[
