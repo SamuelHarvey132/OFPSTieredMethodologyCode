@@ -1,0 +1,237 @@
+# --- 1. Import Libraries ---
+import os
+import xarray as xr
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+import math
+
+# --- 2. Configuration and Setup ---
+
+# --- Project Directory Setup ---
+# This script assumes a standard project structure.
+# It should be run from within the 'src' directory.
+data_dir = '../data'
+results_dir = '../results'
+
+# Create the results directory if it doesn't exist
+os.makedirs(results_dir, exist_ok=True)
+print(f"Output will be saved in: {results_dir}")
+
+# --- Physical Model Constants ---
+TOTAL_PANELS = 24
+PANEL_TILT_ANGLE_DEG = 15.0
+SINGLE_PANEL_AREA_M2 = 1.67
+TOTAL_PANEL_AREA_M2 = TOTAL_PANELS * SINGLE_PANEL_AREA_M2
+PANEL_EFFICIENCY_STC = 0.189
+TEMP_COEFFICIENT_POWER = -0.0035
+ABSORPTION_COEFFICIENT_ALPHA = 0.9
+U_VALUE_EQUATIONS = {
+    0:   {'coeffs': [-0.2077, 9.6903, -4.0275]}, 45:  {'coeffs': [-0.3674, 12.72, -2.916]},
+    90:  {'coeffs': [-0.3315, 13.661, -2.8986]}, 135: {'coeffs': [-0.3493, 11.015, -1.9121]},
+    180: {'coeffs': [-0.2829, 10.707, -4.0648]}, 225: {'coeffs': [-0.2462, 9.3337, -3.2717]},
+    270: {'coeffs': [-0.1987, 7.6439, -4.4963]}, 315: {'coeffs': [-0.1857, 8.69, -3.2924]}
+}
+U_VALUE_ANGLES = np.array(list(U_VALUE_EQUATIONS.keys()))
+CHARACTERISTIC_LENGTH = 5.736
+A_AVG = -6.45
+B_AVG = 21.38
+
+# --- 3. Define Physical Model Functions ---
+
+def get_u_value(wind_speed_mps, wind_direction_deg, panel_azimuth_deg):
+    relative_angle = (wind_direction_deg - panel_azimuth_deg + 360) % 360
+    closest_angle_idx = np.argmin(np.abs(U_VALUE_ANGLES - relative_angle))
+    closest_angle = U_VALUE_ANGLES[closest_angle_idx]
+    eq = U_VALUE_EQUATIONS[closest_angle]
+    a, b, c = eq['coeffs']
+    calculated_u_value = a * wind_speed_mps**2 + b * wind_speed_mps + c
+    if a < 0:
+        x_max = -b / (2 * a)
+        if wind_speed_mps >= x_max:
+            calculated_u_value = a * x_max**2 + b * x_max + c
+    return max(5.0, calculated_u_value)
+
+def calculate_operating_temp_and_efficiency(irradiance_g, ambient_temp_c, u_value):
+    if irradiance_g <= 0:
+        return ambient_temp_c, PANEL_EFFICIENCY_STC * (1 + TEMP_COEFFICIENT_POWER * (ambient_temp_c - 25.0))
+    t_cell = ambient_temp_c + 25
+    for _ in range(10):
+        efficiency = PANEL_EFFICIENCY_STC * (1 + TEMP_COEFFICIENT_POWER * (t_cell - 25.0))
+        t_cell_new = ambient_temp_c + (ABSORPTION_COEFFICIENT_ALPHA * irradiance_g * (1 - efficiency)) / u_value
+        if abs(t_cell_new - t_cell) < 0.1:
+            t_cell = t_cell_new
+            break
+        t_cell = t_cell_new
+    final_efficiency = PANEL_EFFICIENCY_STC * (1 + TEMP_COEFFICIENT_POWER * (t_cell - 25.0))
+    return t_cell, final_efficiency
+
+def calculate_tilted_irradiance(ssrd_j_m2, lat_deg, lon_deg, time_coord, tilt_angle_deg, panel_azimuth_deg):
+    ssrd_w_m2 = ssrd_j_m2 / 3600.0
+    if ssrd_w_m2 <= 0: return 0.0
+    time = pd.to_datetime(str(time_coord))
+    latitude_rad, tilt_rad, panel_azimuth_rad = map(np.radians, [lat_deg, tilt_angle_deg, panel_azimuth_deg])
+    day_of_year = time.timetuple().tm_yday
+
+    utc_hour = time.hour + time.minute / 60.0
+    time_offset = lon_deg / 15.0
+    local_solar_time = utc_hour + time_offset
+    declination_rad = np.radians(-23.45 * np.cos(np.radians(360.0 / 365.0 * (day_of_year + 10))))
+    hour_angle_rad = np.radians(15.0 * (local_solar_time - 12.0))
+
+    solar_altitude_rad = np.arcsin(np.sin(declination_rad) * np.sin(latitude_rad) + np.cos(declination_rad) * np.cos(latitude_rad) * np.cos(hour_angle_rad))
+    if solar_altitude_rad < np.radians(1):
+        return 0.0
+    solar_zenith_rad = np.pi/2 - solar_altitude_rad
+
+    cos_azimuth_num = (np.sin(solar_altitude_rad) * np.sin(latitude_rad) - np.sin(declination_rad))
+    cos_azimuth_den = (np.cos(solar_altitude_rad) * np.cos(latitude_rad))
+    if abs(cos_azimuth_den) < 1e-6: solar_azimuth_rad = 0
+    else: solar_azimuth_rad = np.arccos(np.clip(cos_azimuth_num / cos_azimuth_den, -1, 1))
+    if local_solar_time > 12: solar_azimuth_rad = 2 * np.pi - solar_azimuth_rad
+
+    cos_aoi = (np.cos(solar_zenith_rad) * np.cos(tilt_rad) + np.sin(solar_zenith_rad) * np.sin(tilt_rad) * np.cos(solar_azimuth_rad - panel_azimuth_rad))
+    if cos_aoi <= 0: return 0.0
+
+    ratio = cos_aoi / np.cos(solar_zenith_rad)
+    ratio = min(ratio, 5.0)
+    return max(0, ssrd_w_m2 * ratio)
+
+def calculate_wavelength_depth_dependent(mean_wave_period, depth):
+    g = 9.81
+    if mean_wave_period <=0 or depth <= 0: return 0.0
+    L_deep = (g * mean_wave_period**2) / (2 * np.pi)
+    if depth > L_deep / 2: return L_deep
+    L_n = L_deep
+    for _ in range(10):
+        k = 2 * np.pi / L_n
+        L_nplus1 = L_deep * np.tanh(k * depth)
+        if abs(L_nplus1 - L_n) < 0.01: return L_nplus1
+        L_n = L_nplus1
+    return L_n
+
+def calculate_pitch_amplitude(significant_wave_height, mean_wave_period, depth):
+    if mean_wave_period <= 0 or depth <= 0 or significant_wave_height <= 0: return 0.0
+    wavelength = calculate_wavelength_depth_dependent(mean_wave_period, depth)
+    if wavelength <= 0: return 0.0
+    non_dim_wave_height = significant_wave_height / CHARACTERISTIC_LENGTH
+    non_dim_wavelength = wavelength / CHARACTERISTIC_LENGTH
+    c_predicted = 38 * non_dim_wave_height - 15.81
+    pitch_amplitude = (A_AVG * non_dim_wavelength**2) + (B_AVG * non_dim_wavelength) + c_predicted
+    return max(0, pitch_amplitude)
+
+def get_variable_from_ds(ds, potential_names, ds_key):
+    for name in potential_names:
+        if name in ds.variables: return ds[name]
+    raise KeyError(f"Missing variable in '{ds_key}'")
+
+# --- 4. Define File Paths ---
+coords_file = os.path.join(results_dir, 'Final_Viable_Coordinates.csv')
+era5_files_and_vars = {
+    'u_wind': {'path': os.path.join(data_dir, 'U_wind1.nc'), 'vars': ['u10']},
+    'v_wind': {'path': os.path.join(data_dir, 'V_wind1.nc'), 'vars': ['v10']},
+    'mwp':    {'path': os.path.join(data_dir, 'MeanWavePeriod.nc'), 'vars': ['mwp']},
+    'swh':    {'path': os.path.join(data_dir, 'SignificantWave.nc'), 'vars': ['swh']},
+    'ssrd':   {'path': os.path.join(data_dir, 'SurfaceSolarRadiation.nc'), 'vars': ['ssrd']},
+    't2m':    {'path': os.path.join(data_dir, '2m_temperature.nc'), 'vars': ['t2m']},
+    'depth':  {'path': os.path.join(data_dir, 'Depth.nc'), 'vars': ['wmb', 'depth', 'd2m']}
+}
+output_csv_path = os.path.join(results_dir, 'Power_Estimation_Results.csv')
+
+# --- 5. Load Data ---
+print("Loading coordinates...")
+try:
+    df_coords = pd.read_csv(coords_file)
+    latitudes_to_process = df_coords['latitude'].values
+    longitudes_to_process = df_coords['longitude'].values
+    print(f"Loaded {len(latitudes_to_process)} coordinates from {coords_file}")
+except FileNotFoundError:
+    print(f"ERROR: Coordinates file not found at {coords_file}. Please run previous scripts first.")
+    raise
+
+print("Loading ERA5 datasets...")
+era5_datasets = {key: xr.open_dataset(item['path']) for key, item in era5_files_and_vars.items()}
+
+# --- 6. Prepare ERA5 Data for Analysis ---
+time_coord_name = next(var for var in ['time', 'valid_time'] if var in era5_datasets['u_wind'].coords)
+full_time_coords = era5_datasets['u_wind'][time_coord_name]
+num_time_steps = len(full_time_coords)
+total_years_in_data = (full_time_coords.max() - full_time_coords.min()).dt.days / 365.25
+print(f"\nAnalyzing data across {num_time_steps} time steps, covering approximately {total_years_in_data.item():.2f} years.")
+
+# --- 7. Perform Power Estimation ---
+results = []
+print("\nEstimating power production and losses for all viable sites...")
+for i in tqdm(range(len(latitudes_to_process)), desc="Processing Coordinates"):
+    lat, lon = latitudes_to_process[i], longitudes_to_process[i]
+    hourly_net_power_kwh_list, hourly_operating_efficiencies, hourly_wave_losses = [], [], []
+
+    try:
+        depth_val = get_variable_from_ds(era5_datasets['depth'], era5_files_and_vars['depth']['vars'], 'depth').sel(latitude=lat, longitude=lon, method='nearest').item()
+        depth_val = abs(depth_val)
+        u_wind_ts = get_variable_from_ds(era5_datasets['u_wind'], era5_files_and_vars['u_wind']['vars'], 'u_wind').sel(latitude=lat, longitude=lon, method='nearest').values
+        v_wind_ts = get_variable_from_ds(era5_datasets['v_wind'], era5_files_and_vars['v_wind']['vars'], 'v_wind').sel(latitude=lat, longitude=lon, method='nearest').values
+        mwp_ts = get_variable_from_ds(era5_datasets['mwp'], era5_files_and_vars['mwp']['vars'], 'mwp').sel(latitude=lat, longitude=lon, method='nearest').values
+        swh_ts = get_variable_from_ds(era5_datasets['swh'], era5_files_and_vars['swh']['vars'], 'swh').sel(latitude=lat, longitude=lon, method='nearest').values
+        temp_k_ts = get_variable_from_ds(era5_datasets['t2m'], era5_files_and_vars['t2m']['vars'], 't2m').sel(latitude=lat, longitude=lon, method='nearest').values
+        ssrd_ts = get_variable_from_ds(era5_datasets['ssrd'], era5_files_and_vars['ssrd']['vars'], 'ssrd').sel(latitude=lat, longitude=lon, method='nearest').values
+        time_ts = full_time_coords.values
+    except Exception as e:
+        print(f"Could not retrieve full ERA5 time series for ({lat}, {lon}): {e}. Skipping.")
+        continue
+
+    for t_idx in range(num_time_steps):
+        try:
+            mwp_val, swh_val = mwp_ts[t_idx], swh_ts[t_idx]
+            u_wind_val, v_wind_val = u_wind_ts[t_idx], v_wind_ts[t_idx]
+            ambient_temperature_c = temp_k_ts[t_idx] - 273.15
+            wind_speed_mps = np.sqrt(u_wind_val**2 + v_wind_val**2)
+            wind_direction_deg = (270 - np.degrees(np.arctan2(v_wind_val, u_wind_val))) % 360
+            ssrd_val, time_val = ssrd_ts[t_idx], time_ts[t_idx]
+            
+            irradiance_east = calculate_tilted_irradiance(ssrd_val, lat, lon, time_val, PANEL_TILT_ANGLE_DEG, 90.0)
+            irradiance_west = calculate_tilted_irradiance(ssrd_val, lat, lon, time_val, PANEL_TILT_ANGLE_DEG, 270.0)
+            
+            u_value_east = get_u_value(wind_speed_mps, wind_direction_deg, 90.0)
+            u_value_west = get_u_value(wind_speed_mps, wind_direction_deg, 270.0)
+
+            _, efficiency_east = calculate_operating_temp_and_efficiency(irradiance_east, ambient_temperature_c, u_value_east)
+            _, efficiency_west = calculate_operating_temp_and_efficiency(irradiance_west, ambient_temperature_c, u_value_west)
+            
+            power_east_watts = irradiance_east * (TOTAL_PANEL_AREA_M2 / 2) * efficiency_east
+            power_west_watts = irradiance_west * (TOTAL_PANEL_AREA_M2 / 2) * efficiency_west
+            
+            pitch_amplitude_deg = calculate_pitch_amplitude(swh_val, mwp_val, depth_val)
+            power_loss_factor_waves = np.clip(np.sin(np.radians(pitch_amplitude_deg)), 0, 1)
+            net_power_kwh_timestep = (power_east_watts + power_west_watts) / 1000.0 * (1 - power_loss_factor_waves)
+            
+            hourly_net_power_kwh_list.append(max(0, net_power_kwh_timestep))
+
+            total_irradiance = irradiance_east + irradiance_west
+            if total_irradiance > 0:
+                weighted_avg_efficiency = (efficiency_east * irradiance_east + efficiency_west * irradiance_west) / total_irradiance
+                hourly_operating_efficiencies.append(weighted_avg_efficiency)
+                hourly_wave_losses.append(power_loss_factor_waves)
+        except Exception: 
+            continue
+
+    avg_operating_efficiency = np.mean(hourly_operating_efficiencies) if hourly_operating_efficiencies else 0.0
+    avg_wave_loss = np.mean(hourly_wave_losses) if hourly_wave_losses else 0.0
+    average_yearly_energy_kwh = sum(hourly_net_power_kwh_list) / total_years_in_data.item()
+
+    results.append({
+        'latitude': lat, 'longitude': lon,
+        'Average Yearly Net Energy (kWh)': average_yearly_energy_kwh,
+        'Average Operating Efficiency (%)': avg_operating_efficiency * 100,
+        'Avg Wave Induced Loss (%)': avg_wave_loss * 100
+    })
+
+# --- 8. Output Results ---
+if results:
+    results_df = pd.DataFrame(results)
+    print("\n--- Final Power Estimation Results ---")
+    print(results_df.to_string())
+    results_df.to_csv(output_csv_path, index=False, float_format='%.4f')
+    print(f"\n✅ Full results saved to CSV file: {output_csv_path}")
+else:
+    print("\n⚠️ No power production estimates could be generated.")
