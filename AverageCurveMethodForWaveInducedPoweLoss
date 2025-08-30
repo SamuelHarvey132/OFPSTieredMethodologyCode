@@ -1,0 +1,64 @@
+import numpy as np
+import matplotlib.pyplot as plt
+
+# --- 1. Define Raw Data Points ---
+x_data = np.array([1.561, 1.73, 1.927, 2.16, 2.437])
+y_data_1 = np.array([2.9, 4.0, 3.6, 1.7, 0.8]) # Wave Height 0.05
+y_data_2 = np.array([5.6, 6.7, 5.9, 2.7, 1.6]) # Wave Height 0.1
+
+# --- 2. Define Original Coefficients for Average Shape ---
+a1, b1 = -6.6997, 21.123
+a2, b2 = -6.1958, 21.646
+
+# --- 3. Calculate Average 'a' and 'b' Coefficients ---
+a_avg = (a1 + a2) / 2
+b_avg = (b1 + b2) / 2
+
+# --- 4. Calculate the Best-Fit 'c' Value for each Dataset ---
+y_shape_component = a_avg * x_data**2 + b_avg * x_data
+c_fit_1 = np.mean(y_data_1 - y_shape_component)
+c_fit_2 = np.mean(y_data_2 - y_shape_component)
+
+# --- 5. Calculate R-squared for each Best-Fit Line ---
+y_pred_1 = a_avg * x_data**2 + b_avg * x_data + c_fit_1
+ss_total_1 = np.sum((y_data_1 - np.mean(y_data_1))**2)
+ss_residual_1 = np.sum((y_data_1 - y_pred_1)**2)
+r_squared_1 = 1 - (ss_residual_1 / ss_total_1)
+
+y_pred_2 = a_avg * x_data**2 + b_avg * x_data + c_fit_2
+ss_total_2 = np.sum((y_data_2 - np.mean(y_data_2))**2)
+ss_residual_2 = np.sum((y_data_2 - y_pred_2)**2)
+r_squared_2 = 1 - (ss_residual_2 / ss_total_2)
+
+# --- 6. Set up Smooth Curves for Plotting ---
+x_curve = np.linspace(1.5, 2.5, 400)
+y_fit_1 = a_avg * x_curve**2 + b_avg * x_curve + c_fit_1
+y_fit_2 = a_avg * x_curve**2 + b_avg * x_curve + c_fit_2
+
+# --- 7. Create the Plot ---
+plt.figure(figsize=(12, 8))
+
+# Plot the raw data points
+plt.scatter(x_data, y_data_1, color='orangered', s=80, label='Raw Data (Non-dimensional Wave Height = 0.05)')
+plt.scatter(x_data, y_data_2, color='forestgreen', s=80, label='Raw Data (Non-dimensional Wave Height = 0.1)')
+
+# Plot the best-fit average equations
+plt.plot(x_curve, y_fit_1, 'darkorange', linestyle='--', linewidth=2.5, label=f'Best Fit 1 (y = {a_avg:.2f}x² + {b_avg:.2f}x + {c_fit_1:.2f}, R² = {r_squared_1:.4f})')
+plt.plot(x_curve, y_fit_2, 'darkcyan', linestyle='--', linewidth=2.5, label=f'Best Fit 2 (y = {a_avg:.2f}x² + {b_avg:.2f}x + {c_fit_2:.2f}, R² = {r_squared_2:.4f})')
+
+# --- 8. Customize and Show the Plot with Larger, BOLD Text ---
+plt.title('Raw Data with Best-Fit Averaged Trendlines', fontsize=20, fontweight='bold')
+plt.xlabel('Non-dimensional Wavelength', fontsize=16, fontweight='bold')
+plt.ylabel('Pitch Amplitude (°)', fontsize=16, fontweight='bold')
+plt.grid(True, which='both', linestyle=':', linewidth=0.7)
+plt.legend(fontsize=12, prop={'weight': 'bold'}) # Increase legend font size and make bold
+
+# Get the current axes to modify tick labels
+ax = plt.gca()
+ax.tick_params(axis='both', which='major', labelsize=14)
+for label in ax.get_xticklabels() + ax.get_yticklabels():
+    label.set_fontweight('bold')
+
+plt.ylim(0, 8)
+plt.xlim(1.5, 2.5)
+plt.show()
