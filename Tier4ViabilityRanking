@@ -1,0 +1,188 @@
+# --- 0. Import Libraries ---
+import pandas as pd
+import geopandas as gpd
+import xarray as xr
+import numpy as np
+import os
+import matplotlib.pyplot as plt
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+from shapely.ops import nearest_points
+from tqdm import tqdm
+
+print("Libraries imported successfully.")
+
+# --- 1. Configuration ---
+print("\n--- Configuration ---")
+# Define weights for the final score
+WEIGHT_GRID_DISTANCE = 0.50
+WEIGHT_DOWNTIME = 0.20
+WEIGHT_ENERGY_YIELD = 0.30
+
+# Define the downtime threshold
+DOWNTIME_WAVE_HEIGHT_M = 1.5
+print(f"Weights: Grid={WEIGHT_GRID_DISTANCE*100}%, Downtime={WEIGHT_DOWNTIME*100}%, Energy={WEIGHT_ENERGY_YIELD*100}%")
+print(f"Downtime Threshold: SWH > {DOWNTIME_WAVE_HEIGHT_M} m")
+
+# --- 2. Define File Paths ---
+# This script assumes a standard project structure and should be run from the 'src' directory.
+data_dir = '../data'
+results_dir = '../results'
+
+# Ensure the results directory exists
+os.makedirs(results_dir, exist_ok=True)
+
+# Input file paths
+viable_sites_path = os.path.join(results_dir, 'Power_Estimation_Results.csv')
+grid_infra_path = os.path.join(data_dir, 'Electricity_Transmission_Lines/Electricity_Transmission_Lines.shp')
+wave_data_path = os.path.join(data_dir, 'SignificantWave.nc')
+
+# Output file paths
+output_csv_path = os.path.join(results_dir, 'Final_Ranked_Viability.csv')
+output_map_path = os.path.join(results_dir, 'Final_Ranked_Viability_Map.png')
+output_top10_map_path = os.path.join(results_dir, 'Top_10_Viability_Map.png')
+
+
+# --- 3. Load Data ---
+print("\n--- Loading Data ---")
+try:
+    sites_df = pd.read_csv(viable_sites_path)
+    sites_gdf = gpd.GeoDataFrame(
+        sites_df, geometry=gpd.points_from_xy(sites_df.longitude, sites_df.latitude), crs="EPSG:4326"
+    )
+    print(f"Loaded {len(sites_gdf)} viable sites from {os.path.basename(viable_sites_path)}.")
+
+    grid_gdf = gpd.read_file(grid_infra_path)
+    print(f"Loaded {len(grid_gdf)} grid infrastructure lines.")
+
+    wave_ds = xr.open_dataset(wave_data_path)
+    print("Loaded significant wave height data.")
+except FileNotFoundError as e:
+    print(f"ERROR: A required input file was not found. Please ensure all previous scripts have run successfully. Missing file: {e.filename}")
+    raise
+except Exception as e:
+    print(f"Error loading files: {e}")
+    raise
+
+# --- 4. Feasibility Calculations ---
+print("\n--- Starting Feasibility Calculations (this may take a few minutes) ---")
+
+# A. Calculate Distance to Grid
+print("Step 1/2: Calculating distance to nearest grid line for each site...")
+projected_crs = "EPSG:3857" # Use a projected CRS for accurate distance
+sites_proj = sites_gdf.to_crs(projected_crs)
+grid_proj = grid_gdf.to_crs(projected_crs)
+unified_grid_geom = grid_proj.geometry.unary_union
+
+distances = [point.distance(nearest_points(point, unified_grid_geom)[1]) / 1000 for point in tqdm(sites_proj.geometry, desc="Calculating Grid Distances")]
+sites_gdf['distance_to_grid_km'] = distances
+
+# B. Calculate Potential Downtime
+print("\nStep 2/2: Calculating potential downtime percentage for each site...")
+wave_var_name = list(wave_ds.data_vars)[0]
+downtime_percentages = []
+for index, site in tqdm(sites_gdf.iterrows(), total=sites_gdf.shape[0], desc="Calculating Downtime"):
+    wave_timeseries = wave_ds[wave_var_name].sel(
+        latitude=site.geometry.y, longitude=site.geometry.x, method='nearest'
+    )
+    downtime_hours = (wave_timeseries > DOWNTIME_WAVE_HEIGHT_M).sum().item()
+    total_hours = len(wave_timeseries)
+    percentage = (downtime_hours / total_hours) * 100 if total_hours > 0 else 0
+    downtime_percentages.append(percentage)
+
+sites_gdf['downtime_percentage'] = downtime_percentages
+
+# --- 5. Normalize Scores ---
+print("\n--- Normalizing Scores ---")
+# Normalize scores to be on a scale of 0-100, where 100 is always best.
+sites_gdf['score_grid_dist'] = 100 * (1 - (sites_gdf['distance_to_grid_km'] - sites_gdf['distance_to_grid_km'].min()) / (sites_gdf['distance_to_grid_km'].max() - sites_gdf['distance_to_grid_km'].min()))
+sites_gdf['score_downtime'] = 100 * (1 - (sites_gdf['downtime_percentage'] - sites_gdf['downtime_percentage'].min()) / (sites_gdf['downtime_percentage'].max() - sites_gdf['downtime_percentage'].min()))
+energy_col = 'Average Yearly Net Energy (kWh)'
+sites_gdf['score_energy'] = 100 * (sites_gdf[energy_col] - sites_gdf[energy_col].min()) / (sites_gdf[energy_col].max() - sites_gdf[energy_col].min())
+
+# --- 6. Calculate Final Weighted Score and Rank ---
+print("--- Calculating Final Weighted Score and Ranking ---")
+sites_gdf['final_viability_score'] = (
+    sites_gdf['score_grid_dist'] * WEIGHT_GRID_DISTANCE +
+    sites_gdf['score_downtime'] * WEIGHT_DOWNTIME +
+    sites_gdf['score_energy'] * WEIGHT_ENERGY_YIELD
+)
+sites_gdf['rank'] = sites_gdf['final_viability_score'].rank(method='max', ascending=False).astype(int)
+final_results_df = sites_gdf.sort_values('rank')
+
+# --- 7. Save and Display Results ---
+print("\n--- Final Results ---")
+columns_to_save = [
+    'rank', 'latitude', 'longitude', 'final_viability_score',
+    energy_col, 'distance_to_grid_km', 'downtime_percentage',
+    'score_energy', 'score_grid_dist', 'score_downtime'
+]
+final_results_df[columns_to_save].to_csv(output_csv_path, index=False, float_format='%.2f')
+print(f"✅ Detailed ranking saved to: {output_csv_path}")
+print("\nTop 10 Most Viable Sites:")
+print(final_results_df[columns_to_save].head(10).to_string())
+
+# --- 8. Visualize the Final Ranking (All Sites) ---
+print("\n--- Generating Final Map (All Sites) ---")
+plt.figure(figsize=(16, 14))
+ax = plt.axes(projection=ccrs.PlateCarree())
+ax.set_extent([110, 155, -45, -10], crs=ccrs.PlateCarree())
+ax.add_feature(cfeature.LAND, edgecolor='black', facecolor='lightgray', zorder=0)
+ax.add_feature(cfeature.OCEAN, facecolor='lightblue', zorder=0)
+ax.add_feature(cfeature.BORDERS, linestyle=':', edgecolor='gray')
+grid_gdf.plot(ax=ax, color='purple', linewidth=0.7, label='Electricity Grid', zorder=1, alpha=0.8)
+
+scatter = ax.scatter(
+    final_results_df.longitude, final_results_df.latitude,
+    c=final_results_df.final_viability_score,
+    cmap='viridis', s=20, edgecolor='black',
+    linewidth=0.5, transform=ccrs.PlateCarree(), zorder=2
+)
+cbar = plt.colorbar(scatter, ax=ax, orientation='vertical', pad=0.02, shrink=0.5)
+cbar.set_label('Final Viability Score (100 = Best)', fontsize=12)
+gl = ax.gridlines(draw_labels=True, linestyle='--', color='gray', alpha=0.6)
+gl.top_labels = False
+gl.right_labels = False
+plt.title('Final Viability Ranking of Offshore Solar Sites', fontsize=20)
+plt.legend(['Electricity Grid'], loc='upper left', fontsize=20)
+plt.savefig(output_map_path, dpi=300, bbox_inches='tight')
+print(f"✅ Final viability map saved to: {output_map_path}")
+plt.show()
+
+# --- 9. Visualize Top 10 Sites ---
+print("\n--- Generating Focused Map (Top 10 Sites) ---")
+top_10_sites = final_results_df.head(10)
+plt.figure(figsize=(16, 14))
+ax_top10 = plt.axes(projection=ccrs.PlateCarree())
+ax_top10.add_feature(cfeature.LAND, edgecolor='black', facecolor='lightgray', zorder=0)
+ax_top10.add_feature(cfeature.OCEAN, facecolor='lightblue', zorder=0)
+grid_gdf.plot(ax=ax_top10, color='purple', linewidth=0.7, label='Electricity Grid', zorder=1, alpha=0.5)
+
+ax_top10.scatter(
+    final_results_df.longitude, final_results_df.latitude,
+    color='gray', marker='.', s=20, alpha=0.5,
+    transform=ccrs.PlateCarree(), zorder=2, label='Other Viable Sites'
+)
+ax_top10.scatter(
+    top_10_sites.longitude, top_10_sites.latitude,
+    color='gold', s=150, edgecolor='black',
+    linewidth=1, transform=ccrs.PlateCarree(), zorder=3, label='Top 10 Sites'
+)
+for idx, row in top_10_sites.iterrows():
+    ax_top10.text(
+        row.longitude + 0.1, row.latitude + 0.1, str(row['rank']),
+        color='black', fontsize=12, fontweight='bold',
+        ha='left', va='bottom', transform=ccrs.Geodetic()
+    )
+
+buffer = 1.0
+min_lon, min_lat, max_lon, max_lat = top_10_sites.total_bounds
+ax_top10.set_extent([min_lon - buffer, max_lon + buffer, min_lat - buffer, max_lat + buffer], crs=ccrs.PlateCarree())
+gl_top10 = ax_top10.gridlines(draw_labels=True, linestyle='--', color='gray', alpha=0.6)
+gl_top10.top_labels = False
+gl_top10.right_labels = False
+plt.title('Top 10 Most Viable Offshore Solar Sites', fontsize=20)
+plt.legend(loc='upper left', fontsize=20)
+plt.savefig(output_top10_map_path, dpi=300, bbox_inches='tight')
+print(f"✅ Top 10 viability map saved to: {output_top10_map_path}")
+plt.show()
